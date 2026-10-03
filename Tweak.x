@@ -7,6 +7,7 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 #pragma mark - 前向声明
 
@@ -22,10 +23,16 @@
                                modContactType:(int)type;
 @end
 
+// 以下签名均已对照 8.0.74 二进制的 type encoding 核实
 @interface CContactMgr : NSObject
-- (void)getAllContactList:(NSMutableArray *)list listType:(int)type;
-- (NSArray *)getContactList:(id)arg1 contactType:(int)type;
-- (BOOL)isContactBlack:(id)contact;
+// getContactList:contactType: 的编码是 @24@0:8I16I20, 两个参数都是 unsigned int
+- (NSArray *)getContactList:(unsigned int)type contactType:(unsigned int)mask;
+// 编码 B28@0:8@16I24, 第一个参数是 CContact 对象
+- (BOOL)deleteContact:(id)contact listType:(unsigned int)listType;
+@end
+
+@interface MMNewSessionMgr : NSObject
+- (void)DeleteSessionOfUser:(NSString *)userName; // v24@0:8@16
 @end
 
 #pragma mark - 常量
@@ -129,6 +136,13 @@ static void WCBLToast(NSString *text) {
 }
 
 static NSString *WCBLDisplayName(id contact) {
+    SEL dn = NSSelectorFromString(@"getContactDisplayName");
+    if ([contact respondsToSelector:dn]) {
+        @try {
+            id v = ((id (*)(id, SEL))objc_msgSend)(contact, dn);
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) return v;
+        } @catch (NSException *e) {}
+    }
     NSArray *keys = @[@"m_nsRemark", @"m_nsNickName", @"nickName", @"remark",
                       @"m_nsUsrName", @"usrName", @"m_nsUserName", @"userName"];
     for (NSString *k in keys) {
@@ -150,50 +164,92 @@ static CContactMgr *WCBLContactMgr(void) {
     return [svc isKindOfClass:mgrCls] ? svc : nil;
 }
 
-static NSArray *WCBLFetchBlackListContacts(void) {
+// 取页面当前的模式: 微信 8.0.74 里 ContactsGenericViewController 的 ivar m_iViewType (long long)
+//   0 -> getContactList:8        contactType:-1  (通讯录黑名单)
+//   1 -> getContactList:0x800000 contactType:-1  (社交黑名单)
+// 依据 -[ContactsGenericViewController loadContacts] 反汇编
+static NSArray *WCBLFlattenPageContacts(UIViewController *page) {
+    NSMutableArray *out = [NSMutableArray array];
+    @try {
+        id dic = [page valueForKey:@"m_dicAllContacts"];
+        if (![dic isKindOfClass:[NSDictionary class]]) return out;
+        for (id v in [(NSDictionary *)dic allValues]) {
+            if ([v isKindOfClass:[NSArray class]]) {
+                for (id c in (NSArray *)v)
+                    if ([c respondsToSelector:NSSelectorFromString(@"m_nsUsrName")]) [out addObject:c];
+            } else if ([v respondsToSelector:NSSelectorFromString(@"m_nsUsrName")]) {
+                [out addObject:v];
+            }
+        }
+    } @catch (NSException *e) { WCBLLog(@"读取页面 m_dicAllContacts 异常: %@", e); }
+    return out;
+}
+
+static NSArray *WCBLFetchBlackListContacts(UIViewController *page) {
     CContactMgr *mgr = WCBLContactMgr();
     if (!mgr) { WCBLLog(@"CContactMgr 获取失败"); return @[]; }
 
-    WCBLLog(@"mgr=%@ class=%@", mgr, NSStringFromClass([mgr class]));
-    NSMutableArray *all = [NSMutableArray array];
-    BOOL hasGet = [mgr respondsToSelector:@selector(getAllContactList:listType:)];
-    WCBLLog(@"respondsTo getAllContactList:listType: %d", hasGet);
-    if (hasGet) {
-        for (int t = 0; t <= 3; t++) {
-            WCBLLog(@"即将调用 getAllContactList listType:%d", t); // 若闪退, 日志最后一行即出事位置
-            @try {
-                NSUInteger before = all.count;
-                [mgr getAllContactList:all listType:t];
-                WCBLLog(@"getAllContactList listType:%d 新增 %lu", t, (unsigned long)(all.count - before));
-            } @catch (NSException *e) { WCBLLog(@"listType %d 异常: %@", t, e); }
-        }
-    }
-    WCBLLog(@"共取到 %lu 个联系人, 过滤黑名单", (unsigned long)all.count);
-    if (all.count > 0) WCBLLog(@"首个联系人类: %@", NSStringFromClass([all.firstObject class]));
+    long long mode = 0;
+    @try {
+        id m = [page valueForKey:@"m_iViewType"];
+        if ([m respondsToSelector:@selector(longLongValue)]) mode = [m longLongValue];
+    } @catch (NSException *e) { WCBLLog(@"读取 m_iViewType 失败: %@", e); }
+    unsigned int type = (mode == 1) ? 0x800000u : 8u;
+    WCBLLog(@"页面模式 m_iViewType=%lld -> getContactList:0x%x contactType:-1", mode, type);
 
-    NSMutableArray *black = [NSMutableArray array];
-    NSHashTable *seen = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaquePersonality | NSPointerFunctionsObjectPointerPersonality];
-    BOOL canCheck = [mgr respondsToSelector:@selector(isContactBlack:)];
-    if (!canCheck) WCBLLog(@"isContactBlack: 不存在");
-    NSUInteger idx = 0;
-    for (id c in all) {
-        if (idx % 100 == 0) WCBLLog(@"isContactBlack 检查进度 %lu/%lu", (unsigned long)idx, (unsigned long)all.count);
-        idx++;
+    NSArray *raw = nil;
+    SEL sel = @selector(getContactList:contactType:);
+    if ([mgr respondsToSelector:sel]) {
+        @try { raw = [mgr getContactList:type contactType:0xFFFFFFFFu]; }
+        @catch (NSException *e) { WCBLLog(@"getContactList 异常: %@", e); }
+    } else {
+        WCBLLog(@"CContactMgr 不响应 getContactList:contactType:");
+    }
+    WCBLLog(@"getContactList 返回 %lu 个", (unsigned long)raw.count);
+
+    if (raw.count == 0 && page) {
+        raw = WCBLFlattenPageContacts(page);
+        WCBLLog(@"改读页面自身数据 m_dicAllContacts: %lu 个", (unsigned long)raw.count);
+    }
+
+    NSMutableArray *list = [NSMutableArray array];
+    SEL selDeleted = NSSelectorFromString(@"isAccountDeleted");
+    for (id c in raw) {
         @try {
-            if (canCheck && [mgr isContactBlack:c] && ![seen containsObject:c]) {
-                [seen addObject:c];
-                [black addObject:c];
-            }
+            if ([c respondsToSelector:selDeleted] && ((BOOL (*)(id, SEL))objc_msgSend)(c, selDeleted)) continue;
+            [list addObject:c];
         } @catch (NSException *e) {}
     }
-    WCBLLog(@"黑名单联系人 %lu 个", (unsigned long)black.count);
-    return black;
+    if (list.count > 0) WCBLLog(@"首个联系人类: %@", NSStringFromClass([list.firstObject class]));
+    WCBLLog(@"黑名单联系人 %lu 个", (unsigned long)list.count);
+    return list;
+}
+
+// 与原生 OnContactBatchModify 回调里的本地清理保持一致:
+//   deleteContact:listType:2 / 1, 再 DeleteSessionOfUser:
+static void WCBLLocalCleanup(id contact) {
+    @try {
+        CContactMgr *mgr = WCBLContactMgr();
+        if (mgr && [mgr respondsToSelector:@selector(deleteContact:listType:)]) {
+            [mgr deleteContact:contact listType:2];
+            [mgr deleteContact:contact listType:1];
+        }
+        NSString *un = nil;
+        @try { un = [contact valueForKey:@"m_nsUsrName"]; } @catch (NSException *e) {}
+        Class sc = objc_getClass("MMNewSessionMgr");
+        Class cc = objc_getClass("MMServiceCenter");
+        if (un.length && sc && cc) {
+            id sm = [[cc defaultCenter] getService:sc];
+            if ([sm respondsToSelector:@selector(DeleteSessionOfUser:)]) [sm DeleteSessionOfUser:un];
+        }
+    } @catch (NSException *e) { WCBLLog(@"本地清理异常: %@", e); }
 }
 
 #pragma mark - 批量删除 VC
 
 @interface WCBLBatchDeleteViewController : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) NSArray *contacts;
+@property (nonatomic, weak) UIViewController *hostPage;
 @property (nonatomic, strong) NSMutableSet<NSNumber *> *selected;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIView *bottom;
@@ -422,7 +478,10 @@ static NSArray *WCBLFetchBlackListContacts(void) {
 // 必须在主线程调用
 - (void)handleResult:(int)ret message:(id)msg {
     self.token++; // 让对应的超时/重复回调失效
-    if (ret == 0) self.successCount++;
+    if (ret == 0) {
+        self.successCount++;
+        if (self.deleteIndex < (NSInteger)self.deleteQueue.count) WCBLLocalCleanup(self.deleteQueue[self.deleteIndex]);
+    }
     else { self.failCount++; WCBLLog(@"删除失败 idx=%ld ret=%d msg=%@", (long)self.deleteIndex, ret, msg); }
     self.deleteIndex++;
 
@@ -446,8 +505,10 @@ static NSArray *WCBLFetchBlackListContacts(void) {
     WCBLLog(@"%@", msg);
     self.navigationItem.rightBarButtonItem.enabled = YES;
     if (self.successCount > 0) {
-        self.contacts = WCBLFetchBlackListContacts();
+        self.contacts = WCBLFetchBlackListContacts(self.hostPage);
         [self.selected removeAllObjects];
+        SEL rd = NSSelectorFromString(@"reloadData");
+        if ([self.hostPage respondsToSelector:rd]) { @try { ((void (*)(id, SEL))objc_msgSend)(self.hostPage, rd); } @catch (NSException *e) {} }
         self.title = [NSString stringWithFormat:@"黑名单批量删除 (%lu)", (unsigned long)self.contacts.count];
         self.navigationItem.rightBarButtonItem.title = @"全选";
         [self.tableView reloadData];
@@ -478,9 +539,10 @@ static NSArray *WCBLFetchBlackListContacts(void) {
 
 @implementation WCBLActionTarget
 - (void)open {
+    WCBLLog(@"批量删除按钮被点击");
     UIViewController *host = self.vc;
     if (!host) return;
-    NSArray *contacts = WCBLFetchBlackListContacts();
+    NSArray *contacts = WCBLFetchBlackListContacts(host);
     if (contacts.count == 0) {
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"提示"
             message:@"未获取到黑名单联系人 (接口可能不匹配, 详见 WCBL.log)"
@@ -490,6 +552,7 @@ static NSArray *WCBLFetchBlackListContacts(void) {
         return;
     }
     WCBLBatchDeleteViewController *vc = [[WCBLBatchDeleteViewController alloc] initWithContacts:contacts];
+    vc.hostPage = host;
     if (host.navigationController) [host.navigationController pushViewController:vc animated:YES];
     else {
         UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
@@ -518,8 +581,18 @@ static void WCBLInject(UIViewController *vc) {
 
     // 1) 导航栏按钮
     NSMutableArray *items = [vc.navigationItem.rightBarButtonItems mutableCopy] ?: [NSMutableArray array];
-    UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"批量删除" style:UIBarButtonItemStylePlain
-                                                           target:target action:@selector(open)];
+    UIBarButtonItem *btn = nil;
+    UIAction *act = nil;
+    if (@available(iOS 14.0, *)) {
+        // 用 UIAction 回调, 不经过 -[UIApplication sendAction:to:from:forEvent:],
+        // 避免被其他插件 (如 QiangDanAuto) 对该方法的 hook 干扰而崩溃
+        act = [UIAction actionWithTitle:@"批量删除" image:nil identifier:nil
+                                handler:^(__kindof UIAction *a) { [target open]; }];
+        btn = [[UIBarButtonItem alloc] initWithTitle:@"批量删除" image:nil primaryAction:act menu:nil];
+    } else {
+        btn = [[UIBarButtonItem alloc] initWithTitle:@"批量删除" style:UIBarButtonItemStylePlain
+                                              target:target action:@selector(open)];
+    }
     [items addObject:btn];
     vc.navigationItem.rightBarButtonItems = items;
 
@@ -533,7 +606,11 @@ static void WCBLInject(UIViewController *vc) {
     fab.frame = CGRectMake(vc.view.bounds.size.width - 110,
                            vc.view.bounds.size.height - vc.view.safeAreaInsets.bottom - 90, 96, 40);
     fab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
-    [fab addTarget:target action:@selector(open) forControlEvents:UIControlEventTouchUpInside];
+    if (act) {
+        if (@available(iOS 14.0, *)) [fab addAction:act forControlEvents:UIControlEventTouchUpInside];
+    } else {
+        [fab addTarget:target action:@selector(open) forControlEvents:UIControlEventTouchUpInside];
+    }
     [vc.view addSubview:fab];
     WCBLLog(@"已注入批量删除按钮");
 }
