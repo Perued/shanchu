@@ -263,6 +263,60 @@ static void WCBLLocalCleanup(id contact) {
     } @catch (NSException *e) { WCBLLog(@"本地清理异常: %@", e); }
 }
 
+#pragma mark - 已删除记录 (持久化, 中途退出后再进可直接跳过)
+
+static NSString *const kWCBLDoneKey = @"WCBLDeletedUsers";
+
+static NSString *WCBLUserName(id contact) {
+    @try {
+        id v = [contact valueForKey:@"m_nsUsrName"];
+        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) return v;
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+static NSMutableSet *WCBLDoneSet(void) {
+    NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:kWCBLDoneKey];
+    return a ? [NSMutableSet setWithArray:a] : [NSMutableSet set];
+}
+
+static void WCBLSaveDoneSet(NSSet *set) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:[set allObjects] forKey:kWCBLDoneKey];
+    [ud synchronize]; // 立即落盘, 防止随后被杀进程丢记录
+}
+
+static BOOL WCBLIsDone(id contact) {
+    NSString *un = WCBLUserName(contact);
+    return un && [WCBLDoneSet() containsObject:un];
+}
+
+static void WCBLMarkDone(id contact) {
+    NSString *un = WCBLUserName(contact);
+    if (!un) return;
+    NSMutableSet *set = WCBLDoneSet();
+    [set addObject:un];
+    WCBLSaveDoneSet(set);
+    WCBLLog(@"已记录删除: %@ (累计 %lu)", un, (unsigned long)set.count);
+}
+
+// 清理记录: 已不在当前黑名单里的用户不再需要记录。
+// 这样如果以后又把同一个人拉黑, 不会被误当成"已删除"而跳过。
+// 列表为空时不清理, 避免取数失败导致记录被误清。
+static void WCBLPruneDone(NSArray *currentList) {
+    if (currentList.count == 0) return;
+    NSMutableSet *set = WCBLDoneSet();
+    if (set.count == 0) return;
+    NSMutableSet *present = [NSMutableSet set];
+    for (id c in currentList) { NSString *un = WCBLUserName(c); if (un) [present addObject:un]; }
+    NSMutableSet *keep = [set mutableCopy];
+    [keep intersectSet:present];
+    if (keep.count != set.count) {
+        WCBLLog(@"清理删除记录: %lu -> %lu", (unsigned long)set.count, (unsigned long)keep.count);
+        WCBLSaveDoneSet(keep);
+    }
+}
+
 #pragma mark - 批量删除 VC
 
 @interface WCBLBatchDeleteViewController : UIViewController <UITableViewDelegate, UITableViewDataSource>
@@ -287,6 +341,8 @@ static void WCBLLocalCleanup(id contact) {
 @property (nonatomic, assign) NSInteger deleteIndex;
 @property (nonatomic, assign) NSInteger successCount;
 @property (nonatomic, assign) NSInteger failCount;
+@property (nonatomic, assign) NSInteger skipCount;
+@property (nonatomic, strong) UIBarButtonItem *clearItem;
 @property (nonatomic, assign) NSInteger token; // 用于识别当前等待中的回调/超时
 @property (nonatomic, assign) BOOL isDeleting;
 - (instancetype)initWithContacts:(NSArray *)contacts;
@@ -318,11 +374,13 @@ static void WCBLLocalCleanup(id contact) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = [NSString stringWithFormat:@"黑名单批量删除 (%lu)", (unsigned long)self.contacts.count];
+    [self refreshTitle];
     self.view.backgroundColor = [UIColor systemBackgroundColor];
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"全选" style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(onSelectAllTapped)];
+    UIBarButtonItem *selAll = [[UIBarButtonItem alloc] initWithTitle:@"全选" style:UIBarButtonItemStylePlain
+                                                              target:self action:@selector(onSelectAllTapped)];
+    self.clearItem = [[UIBarButtonItem alloc] initWithTitle:@"清记录" style:UIBarButtonItemStylePlain
+                                                     target:self action:@selector(onClearRecordTapped)];
+    self.navigationItem.rightBarButtonItems = @[selAll, self.clearItem]; // rightBarButtonItem 仍指向 selAll
 
     self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.tableView.delegate = self;
@@ -428,9 +486,12 @@ static void WCBLLocalCleanup(id contact) {
 }
 
 - (void)onSelectAllTapped {
-    BOOL allSelected = self.selected.count == self.contacts.count;
+    NSMutableArray *pendingIdx = [NSMutableArray array];
+    for (NSUInteger i = 0; i < self.contacts.count; i++)
+        if (!WCBLIsDone(self.contacts[i])) [pendingIdx addObject:@(i)]; // 已删除的不参与全选
+    BOOL allSelected = pendingIdx.count > 0 && self.selected.count == pendingIdx.count;
     [self.selected removeAllObjects];
-    if (!allSelected) for (NSUInteger i = 0; i < self.contacts.count; i++) [self.selected addObject:@(i)];
+    if (!allSelected) [self.selected addObjectsFromArray:pendingIdx];
     self.navigationItem.rightBarButtonItem.title = allSelected ? @"全选" : @"取消全选";
     [self.tableView reloadData];
     [self refreshDeleteButton];
@@ -450,14 +511,23 @@ static void WCBLLocalCleanup(id contact) {
     static NSString *rid = @"wcbl_cell";
     UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:rid];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:rid];
-    cell.textLabel.text = WCBLDisplayName(self.contacts[ip.row]);
-    cell.accessoryType = [self.selected containsObject:@(ip.row)] ?
-        UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    id contact = self.contacts[ip.row];
+    if (WCBLIsDone(contact)) {
+        cell.textLabel.text = [WCBLDisplayName(contact) stringByAppendingString:@"  (已删除,跳过)"];
+        cell.textLabel.textColor = [UIColor tertiaryLabelColor];
+        cell.accessoryType = UITableViewCellAccessoryNone;
+    } else {
+        cell.textLabel.text = WCBLDisplayName(contact);
+        cell.textLabel.textColor = [UIColor labelColor];
+        cell.accessoryType = [self.selected containsObject:@(ip.row)] ?
+            UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    }
     return cell;
 }
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (self.isDeleting) return;
+    if (WCBLIsDone(self.contacts[ip.row])) return; // 已删除的不可选
     NSNumber *k = @(ip.row);
     if ([self.selected containsObject:k]) [self.selected removeObject:k]; else [self.selected addObject:k];
     [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
@@ -470,7 +540,11 @@ static void WCBLLocalCleanup(id contact) {
     if (self.isDeleting || self.selected.count == 0) return;
     NSMutableArray *queue = [NSMutableArray array];
     NSArray *sorted = [[self.selected allObjects] sortedArrayUsingSelector:@selector(compare:)];
-    for (NSNumber *n in sorted) [queue addObject:self.contacts[n.integerValue]];
+    for (NSNumber *n in sorted) {
+        id c = self.contacts[n.integerValue];
+        if (!WCBLIsDone(c)) [queue addObject:c];
+    }
+    if (queue.count == 0) return;
 
     NSString *msg = [NSString stringWithFormat:@"将逐个删除 %lu 个联系人, 每次间隔在 %.0f~%.0f 秒之间随机。删除后不可恢复, 是否继续?",
                      (unsigned long)queue.count, self.minInterval, self.maxInterval];
@@ -491,6 +565,8 @@ static void WCBLLocalCleanup(id contact) {
     self.failCount = 0;
     [self refreshDeleteButton];
     self.navigationItem.rightBarButtonItem.enabled = NO;
+    self.clearItem.enabled = NO;
+    self.skipCount = 0;
 
     Class logicCls = objc_getClass("ContactBatchModifyLogic");
     if (!logicCls) { [self finishWithError:@"ContactBatchModifyLogic 不存在 (版本不匹配)"]; return; }
@@ -502,7 +578,47 @@ static void WCBLLocalCleanup(id contact) {
     [self deleteNext];
 }
 
+// 跳过队列里已经删除过的联系人 (不计等待间隔)
+- (void)skipDoneItems {
+    while (self.deleteIndex < (NSInteger)self.deleteQueue.count &&
+           WCBLIsDone(self.deleteQueue[self.deleteIndex])) {
+        WCBLLog(@"跳过已删除: %@", WCBLDisplayName(self.deleteQueue[self.deleteIndex]));
+        self.skipCount++;
+        self.deleteIndex++;
+    }
+}
+
+- (NSUInteger)pendingCount {
+    NSUInteger n = 0;
+    for (id c in self.contacts) if (!WCBLIsDone(c)) n++;
+    return n;
+}
+
+- (void)refreshTitle {
+    self.title = [NSString stringWithFormat:@"黑名单批量删除 (待删 %lu / 共 %lu)",
+                  (unsigned long)[self pendingCount], (unsigned long)self.contacts.count];
+}
+
+- (void)onClearRecordTapped {
+    if (self.isDeleting) return;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"清除删除记录"
+        message:@"清除后,之前标记为\"已删除\"的联系人如果仍在黑名单里,会重新变为可删除。是否继续?"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        WCBLSaveDoneSet([NSSet set]);
+        WCBLLog(@"已清除全部删除记录");
+        [ws.selected removeAllObjects];
+        [ws refreshTitle];
+        [ws.tableView reloadData];
+        [ws refreshDeleteButton];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
 - (void)deleteNext {
+    [self skipDoneItems];
     if (self.deleteIndex >= (NSInteger)self.deleteQueue.count) { [self finishDone]; return; }
     id contact = self.deleteQueue[self.deleteIndex];
     NSString *name = WCBLDisplayName(contact);
@@ -544,10 +660,15 @@ static void WCBLLocalCleanup(id contact) {
     self.token++; // 让对应的超时/重复回调失效
     if (ret == 0) {
         self.successCount++;
-        if (self.deleteIndex < (NSInteger)self.deleteQueue.count) WCBLLocalCleanup(self.deleteQueue[self.deleteIndex]);
+        if (self.deleteIndex < (NSInteger)self.deleteQueue.count) {
+            id done = self.deleteQueue[self.deleteIndex];
+            WCBLMarkDone(done);       // 先记录, 即使之后中途退出也不会重复删
+            WCBLLocalCleanup(done);
+        }
     }
     else { self.failCount++; WCBLLog(@"删除失败 idx=%ld ret=%d msg=%@", (long)self.deleteIndex, ret, msg); }
     self.deleteIndex++;
+    [self skipDoneItems];
 
     if (self.deleteIndex >= (NSInteger)self.deleteQueue.count) { [self finishDone]; return; }
 
@@ -563,17 +684,19 @@ static void WCBLLocalCleanup(id contact) {
     self.token++;
     self.batchLogic = nil;
     self.progressView.progress = 1.0;
-    NSString *msg = [NSString stringWithFormat:@"完成: 成功 %ld, 失败 %ld",
-                     (long)self.successCount, (long)self.failCount];
+    NSString *msg = [NSString stringWithFormat:@"完成: 成功 %ld, 失败 %ld, 跳过(已删除) %ld",
+                     (long)self.successCount, (long)self.failCount, (long)self.skipCount];
     self.statusLabel.text = msg;
     WCBLLog(@"%@", msg);
     self.navigationItem.rightBarButtonItem.enabled = YES;
+    self.clearItem.enabled = YES;
     if (self.successCount > 0) {
         self.contacts = WCBLFetchBlackListContacts(self.hostPage);
+        WCBLPruneDone(self.contacts);
         [self.selected removeAllObjects];
         SEL rd = NSSelectorFromString(@"reloadData");
         if ([self.hostPage respondsToSelector:rd]) { @try { ((void (*)(id, SEL))objc_msgSend)(self.hostPage, rd); } @catch (NSException *e) {} }
-        self.title = [NSString stringWithFormat:@"黑名单批量删除 (%lu)", (unsigned long)self.contacts.count];
+        [self refreshTitle];
         self.navigationItem.rightBarButtonItem.title = @"全选";
         [self.tableView reloadData];
     }
@@ -590,6 +713,7 @@ static void WCBLLocalCleanup(id contact) {
     WCBLLog(@"%@", msg);
     [self refreshDeleteButton];
     self.navigationItem.rightBarButtonItem.enabled = YES;
+    self.clearItem.enabled = YES;
 }
 
 @end
@@ -615,6 +739,7 @@ static void WCBLLocalCleanup(id contact) {
         [host presentViewController:ac animated:YES completion:nil];
         return;
     }
+    WCBLPruneDone(contacts);
     WCBLBatchDeleteViewController *vc = [[WCBLBatchDeleteViewController alloc] initWithContacts:contacts];
     vc.hostPage = host;
     if (host.navigationController) [host.navigationController pushViewController:vc animated:YES];
