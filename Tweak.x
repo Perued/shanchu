@@ -23,6 +23,18 @@
                                modContactType:(int)type;
 @end
 
+@interface CContactMgr : NSObject
+- (void)getAllContactList:(NSMutableArray *)list listType:(int)type;
+- (NSArray *)getContactList:(id)arg1 contactType:(int)type;
+- (BOOL)isContactBlack:(id)contact;
+@end
+
+// UIViewController 扩展方法前向声明 (供 %hook 内调用)
+@interface UIViewController (WCBLAdditions)
+- (void)wcbl_maybeInject;
+- (void)wcbl_openBatchDelete;
+@end
+
 @protocol ContactBatchModifyLogicDelegate <NSObject>
 @optional
 - (void)OnContactBatchModify:(id)arg1 withRet:(int)arg2 errorMsg:(id)arg3 isNetWorkError:(BOOL)arg4;
@@ -58,18 +70,19 @@ static NSString *WCBLDisplayName(id contact) {
 }
 
 // 取 CContactMgr 单例
-static id WCBLContactMgr(void) {
+static CContactMgr *WCBLContactMgr(void) {
     Class centerCls = objc_getClass("MMServiceCenter");
     Class mgrCls = objc_getClass("CContactMgr");
     if (!centerCls || !mgrCls) return nil;
     id center = [centerCls defaultCenter];
     if (![center respondsToSelector:@selector(getService:)]) return nil;
-    return [center getService:mgrCls];
+    id svc = [center getService:mgrCls];
+    return [svc isKindOfClass:mgrCls] ? svc : nil;
 }
 
 // 获取黑名单联系人数组
 static NSArray *WCBLFetchBlackListContacts(void) {
-    id mgr = WCBLContactMgr();
+    CContactMgr *mgr = WCBLContactMgr();
     if (!mgr) { WCBLLog(@"CContactMgr 获取失败"); return @[]; }
 
     NSMutableArray *all = [NSMutableArray array];
