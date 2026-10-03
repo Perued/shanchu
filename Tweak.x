@@ -154,9 +154,13 @@ static NSArray *WCBLFetchBlackListContacts(void) {
     CContactMgr *mgr = WCBLContactMgr();
     if (!mgr) { WCBLLog(@"CContactMgr 获取失败"); return @[]; }
 
+    WCBLLog(@"mgr=%@ class=%@", mgr, NSStringFromClass([mgr class]));
     NSMutableArray *all = [NSMutableArray array];
-    if ([mgr respondsToSelector:@selector(getAllContactList:listType:)]) {
+    BOOL hasGet = [mgr respondsToSelector:@selector(getAllContactList:listType:)];
+    WCBLLog(@"respondsTo getAllContactList:listType: %d", hasGet);
+    if (hasGet) {
         for (int t = 0; t <= 3; t++) {
+            WCBLLog(@"即将调用 getAllContactList listType:%d", t); // 若闪退, 日志最后一行即出事位置
             @try {
                 NSUInteger before = all.count;
                 [mgr getAllContactList:all listType:t];
@@ -164,19 +168,17 @@ static NSArray *WCBLFetchBlackListContacts(void) {
             } @catch (NSException *e) { WCBLLog(@"listType %d 异常: %@", t, e); }
         }
     }
-    if (all.count == 0 && [mgr respondsToSelector:@selector(getContactList:contactType:)]) {
-        @try {
-            NSArray *r = [mgr getContactList:nil contactType:0];
-            if ([r isKindOfClass:[NSArray class]]) [all addObjectsFromArray:r];
-        } @catch (NSException *e) {}
-    }
     WCBLLog(@"共取到 %lu 个联系人, 过滤黑名单", (unsigned long)all.count);
+    if (all.count > 0) WCBLLog(@"首个联系人类: %@", NSStringFromClass([all.firstObject class]));
 
     NSMutableArray *black = [NSMutableArray array];
     NSHashTable *seen = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaquePersonality | NSPointerFunctionsObjectPointerPersonality];
     BOOL canCheck = [mgr respondsToSelector:@selector(isContactBlack:)];
     if (!canCheck) WCBLLog(@"isContactBlack: 不存在");
+    NSUInteger idx = 0;
     for (id c in all) {
+        if (idx % 100 == 0) WCBLLog(@"isContactBlack 检查进度 %lu/%lu", (unsigned long)idx, (unsigned long)all.count);
+        idx++;
         @try {
             if (canCheck && [mgr isContactBlack:c] && ![seen containsObject:c]) {
                 [seen addObject:c];
