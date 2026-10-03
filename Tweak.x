@@ -32,7 +32,9 @@
 
 #pragma mark - 常量
 
-static NSString *const kWCBLIntervalKey = @"WCBLDeleteInterval";
+static NSString *const kWCBLIntervalKey = @"WCBLDeleteInterval";       // 旧版固定间隔, 仅用于迁移
+static NSString *const kWCBLMinKey = @"WCBLDeleteIntervalMin";
+static NSString *const kWCBLMaxKey = @"WCBLDeleteIntervalMax";
 static const NSTimeInterval kWCBLDefaultInterval = 5.0;
 static const NSTimeInterval kWCBLMaxInterval = 300.0;
 static const NSTimeInterval kWCBLCallbackTimeout = 30.0;
@@ -269,13 +271,17 @@ static void WCBLLocalCleanup(id contact) {
 @property (nonatomic, strong) NSMutableSet<NSNumber *> *selected;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIView *bottom;
-@property (nonatomic, strong) UILabel *capLabel;
-@property (nonatomic, strong) UIStepper *stepper;
-@property (nonatomic, strong) UILabel *intervalLabel;
+@property (nonatomic, strong) UILabel *minCapLabel;
+@property (nonatomic, strong) UILabel *maxCapLabel;
+@property (nonatomic, strong) UIStepper *minStepper;
+@property (nonatomic, strong) UIStepper *maxStepper;
+@property (nonatomic, strong) UILabel *minLabel;
+@property (nonatomic, strong) UILabel *maxLabel;
 @property (nonatomic, strong) UIButton *deleteButton;
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, assign) NSTimeInterval interval;
+@property (nonatomic, assign) NSTimeInterval minInterval;
+@property (nonatomic, assign) NSTimeInterval maxInterval;
 @property (nonatomic, strong) ContactBatchModifyLogic *batchLogic;
 @property (nonatomic, strong) NSArray *deleteQueue;
 @property (nonatomic, assign) NSInteger deleteIndex;
@@ -294,8 +300,18 @@ static void WCBLLocalCleanup(id contact) {
     if (self = [super init]) {
         _contacts = contacts;
         _selected = [NSMutableSet set];
-        _interval = [[NSUserDefaults standardUserDefaults] doubleForKey:kWCBLIntervalKey];
-        if (_interval < 1) _interval = kWCBLDefaultInterval;
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        _minInterval = [ud doubleForKey:kWCBLMinKey];
+        _maxInterval = [ud doubleForKey:kWCBLMaxKey];
+        if (_minInterval < 1) {
+            // 迁移旧版固定间隔: 最小=旧值, 最大=旧值+5
+            double old = [ud doubleForKey:kWCBLIntervalKey];
+            _minInterval = old >= 1 ? old : kWCBLDefaultInterval;
+            _maxInterval = _minInterval + 5;
+        }
+        if (_maxInterval < _minInterval) _maxInterval = _minInterval;
+        if (_maxInterval > kWCBLMaxInterval) _maxInterval = kWCBLMaxInterval;
+        if (_minInterval > _maxInterval) _minInterval = _maxInterval;
     }
     return self;
 }
@@ -317,22 +333,34 @@ static void WCBLLocalCleanup(id contact) {
     self.bottom.backgroundColor = [UIColor secondarySystemBackgroundColor];
     [self.view addSubview:self.bottom];
 
-    self.capLabel = [[UILabel alloc] init];
-    self.capLabel.text = @"删除间隔(秒)";
-    self.capLabel.font = [UIFont systemFontOfSize:14];
-    [self.bottom addSubview:self.capLabel];
+    self.minCapLabel = [[UILabel alloc] init];
+    self.minCapLabel.text = @"最小间隔(秒)";
+    self.minCapLabel.font = [UIFont systemFontOfSize:14];
+    [self.bottom addSubview:self.minCapLabel];
 
-    self.intervalLabel = [[UILabel alloc] init];
-    self.intervalLabel.font = [UIFont boldSystemFontOfSize:16];
-    [self.bottom addSubview:self.intervalLabel];
+    self.maxCapLabel = [[UILabel alloc] init];
+    self.maxCapLabel.text = @"最大间隔(秒)";
+    self.maxCapLabel.font = [UIFont systemFontOfSize:14];
+    [self.bottom addSubview:self.maxCapLabel];
 
-    self.stepper = [[UIStepper alloc] init];
-    self.stepper.minimumValue = 1;
-    self.stepper.maximumValue = kWCBLMaxInterval;
-    self.stepper.stepValue = 1;
-    self.stepper.value = self.interval;
-    [self.stepper addTarget:self action:@selector(onStepperChanged) forControlEvents:UIControlEventValueChanged];
-    [self.bottom addSubview:self.stepper];
+    self.minLabel = [[UILabel alloc] init];
+    self.minLabel.font = [UIFont boldSystemFontOfSize:16];
+    [self.bottom addSubview:self.minLabel];
+    self.maxLabel = [[UILabel alloc] init];
+    self.maxLabel.font = [UIFont boldSystemFontOfSize:16];
+    [self.bottom addSubview:self.maxLabel];
+
+    self.minStepper = [[UIStepper alloc] init];
+    self.maxStepper = [[UIStepper alloc] init];
+    for (UIStepper *st in @[self.minStepper, self.maxStepper]) {
+        st.minimumValue = 1;
+        st.maximumValue = kWCBLMaxInterval;
+        st.stepValue = 1;
+        [st addTarget:self action:@selector(onStepperChanged:) forControlEvents:UIControlEventValueChanged];
+        [self.bottom addSubview:st];
+    }
+    self.minStepper.value = self.minInterval;
+    self.maxStepper.value = self.maxInterval;
     [self refreshIntervalLabel];
 
     self.progressView = [[UIProgressView alloc] init];
@@ -359,24 +387,44 @@ static void WCBLLocalCleanup(id contact) {
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
     CGFloat inset = self.view.safeAreaInsets.bottom;
-    CGFloat bottomH = 140 + inset;
+    CGFloat bottomH = 176 + inset;
     self.tableView.frame = CGRectMake(0, 0, w, h - bottomH);
     self.bottom.frame = CGRectMake(0, h - bottomH, w, bottomH);
-    self.capLabel.frame = CGRectMake(16, 8, 120, 30);
-    self.intervalLabel.frame = CGRectMake(140, 8, 60, 30);
-    self.stepper.frame = CGRectMake(210, 8, 100, 30);
-    self.progressView.frame = CGRectMake(16, 48, w - 32, 10);
-    self.statusLabel.frame = CGRectMake(16, 60, w - 32, 20);
-    self.deleteButton.frame = CGRectMake(16, 86, w - 32, 44);
+    self.minCapLabel.frame = CGRectMake(16, 6, 120, 30);
+    self.minLabel.frame = CGRectMake(140, 6, 60, 30);
+    self.minStepper.frame = CGRectMake(210, 6, 100, 30);
+    self.maxCapLabel.frame = CGRectMake(16, 40, 120, 30);
+    self.maxLabel.frame = CGRectMake(140, 40, 60, 30);
+    self.maxStepper.frame = CGRectMake(210, 40, 100, 30);
+    self.progressView.frame = CGRectMake(16, 82, w - 32, 10);
+    self.statusLabel.frame = CGRectMake(16, 94, w - 32, 20);
+    self.deleteButton.frame = CGRectMake(16, 120, w - 32, 44);
 }
 
-- (void)onStepperChanged {
-    self.interval = self.stepper.value;
-    [[NSUserDefaults standardUserDefaults] setDouble:self.interval forKey:kWCBLIntervalKey];
+- (void)onStepperChanged:(UIStepper *)sender {
+    if (sender == self.minStepper) {
+        self.minInterval = self.minStepper.value;
+        if (self.maxInterval < self.minInterval) { self.maxInterval = self.minInterval; self.maxStepper.value = self.maxInterval; }
+    } else {
+        self.maxInterval = self.maxStepper.value;
+        if (self.minInterval > self.maxInterval) { self.minInterval = self.maxInterval; self.minStepper.value = self.minInterval; }
+    }
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setDouble:self.minInterval forKey:kWCBLMinKey];
+    [ud setDouble:self.maxInterval forKey:kWCBLMaxKey];
     [self refreshIntervalLabel];
 }
 - (void)refreshIntervalLabel {
-    self.intervalLabel.text = [NSString stringWithFormat:@"%.0f", self.interval];
+    self.minLabel.text = [NSString stringWithFormat:@"%.0f", self.minInterval];
+    self.maxLabel.text = [NSString stringWithFormat:@"%.0f", self.maxInterval];
+}
+
+// 在 [min, max] 之间随机取一个间隔 (精度 0.001 秒)
+- (NSTimeInterval)randomInterval {
+    double lo = self.minInterval, hi = self.maxInterval;
+    if (hi <= lo) return lo;
+    uint32_t steps = (uint32_t)((hi - lo) * 1000.0) + 1;
+    return lo + (double)arc4random_uniform(steps) / 1000.0;
 }
 
 - (void)onSelectAllTapped {
@@ -424,8 +472,8 @@ static void WCBLLocalCleanup(id contact) {
     NSArray *sorted = [[self.selected allObjects] sortedArrayUsingSelector:@selector(compare:)];
     for (NSNumber *n in sorted) [queue addObject:self.contacts[n.integerValue]];
 
-    NSString *msg = [NSString stringWithFormat:@"将逐个删除 %lu 个联系人, 间隔 %.0f 秒。删除后不可恢复, 是否继续?",
-                     (unsigned long)queue.count, self.interval];
+    NSString *msg = [NSString stringWithFormat:@"将逐个删除 %lu 个联系人, 每次间隔在 %.0f~%.0f 秒之间随机。删除后不可恢复, 是否继续?",
+                     (unsigned long)queue.count, self.minInterval, self.maxInterval];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"确认删除" message:msg
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -450,7 +498,7 @@ static void WCBLLocalCleanup(id contact) {
     if ([self.batchLogic respondsToSelector:@selector(setM_delegate:)])
         [self.batchLogic setM_delegate:self];
 
-    WCBLLog(@"开始批量删除, 共 %lu 个, 间隔 %.0fs", (unsigned long)queue.count, self.interval);
+    WCBLLog(@"开始批量删除, 共 %lu 个, 随机间隔 %.0f~%.0fs", (unsigned long)queue.count, self.minInterval, self.maxInterval);
     [self deleteNext];
 }
 
@@ -503,8 +551,8 @@ static void WCBLLocalCleanup(id contact) {
 
     if (self.deleteIndex >= (NSInteger)self.deleteQueue.count) { [self finishDone]; return; }
 
-    NSTimeInterval iv = self.interval;
-    WCBLLog(@"等待 %.0fs 后继续 (%ld/%lu)", iv, (long)(self.deleteIndex + 1), (unsigned long)self.deleteQueue.count);
+    NSTimeInterval iv = [self randomInterval];
+    WCBLLog(@"等待 %.1fs 后继续 (%ld/%lu)", iv, (long)(self.deleteIndex + 1), (unsigned long)self.deleteQueue.count);
     __weak typeof(self) ws = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(iv * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ if (ws.isDeleting) [ws deleteNext]; });
