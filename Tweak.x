@@ -46,8 +46,12 @@ static NSString *const kWCBLIntervalKey = @"WCBLDeleteInterval";
 static const NSTimeInterval kWCBLDefaultInterval = 5.0;
 static const NSTimeInterval kWCBLMaxInterval = 300.0;
 
-// 文件日志路径: /var/mobile/WCBL.log (Filza 直接打开即可, 无需抓系统日志)
-static NSString *WCBLLogFilePath(void) { return @"/var/mobile/WCBL.log"; }
+// 文件日志路径: 微信沙盒 Documents/WCBL.log
+// (TrollStore 注入的 App 写不到 /var/mobile, 必须放在沙盒内)
+static NSString *WCBLLogFilePath(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return [docs stringByAppendingPathComponent:@"WCBL.log"];
+}
 
 static void WCBLWriteFileLog(NSString *msg) {
     static dispatch_queue_t q;
@@ -485,4 +489,5 @@ static NSArray *WCBLFetchBlackListContacts(void) {
 
 %ctor {
     WCBLLog(@"WCBlackListBatchDelete 加载完成");
+    NSLog(@"[WCBL] 日志文件路径: %@", WCBLLogFilePath());
 }
