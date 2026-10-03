@@ -46,7 +46,44 @@ static NSString *const kWCBLIntervalKey = @"WCBLDeleteInterval";
 static const NSTimeInterval kWCBLDefaultInterval = 5.0;
 static const NSTimeInterval kWCBLMaxInterval = 300.0;
 
-#define WCBLLog(fmt, ...) NSLog(@"[WCBL] " fmt, ##__VA_ARGS__)
+// 文件日志路径: /var/mobile/WCBL.log (Filza 直接打开即可, 无需抓系统日志)
+static NSString *WCBLLogFilePath(void) { return @"/var/mobile/WCBL.log"; }
+
+static void WCBLWriteFileLog(NSString *msg) {
+    static dispatch_queue_t q;
+    static NSFileHandle *fh;
+    static NSDateFormatter *df;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.wcbl.filelog", DISPATCH_QUEUE_SERIAL);
+        df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"MM-dd HH:mm:ss.SSS";
+        NSString *path = WCBLLogFilePath();
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+        if ([attr[NSFileSize] unsignedLongLongValue] > 2 * 1024 * 1024) {
+            [fm removeItemAtPath:path error:nil]; // 超过 2MB 清空重来
+        }
+        if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        [fh seekToEndOfFile];
+    });
+    if (!fh) return;
+    NSString *proc = [[NSProcessInfo processInfo] processName];
+    dispatch_async(q, ^{
+        NSString *line = [NSString stringWithFormat:@"%@ [%@] %@\n",
+                          [df stringFromDate:[NSDate date]], proc, msg];
+        @try { [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; }
+        @catch (NSException *e) {}
+    });
+}
+
+// 同时写 NSLog(系统日志) 和文件日志
+#define WCBLLog(fmt, ...) do { \
+    NSString *_wcbl_m = [NSString stringWithFormat:@"[WCBL] " fmt, ##__VA_ARGS__]; \
+    NSLog(@"%@", _wcbl_m); \
+    WCBLWriteFileLog(_wcbl_m); \
+} while(0)
 
 #pragma mark - 工具函数
 
@@ -403,13 +440,23 @@ static NSArray *WCBLFetchBlackListContacts(void) {
     }
     if (!match) return;
 
-    WCBLLog(@"检测到黑名单页面: %@", clsName);
+    WCBLLog(@"检测到黑名单页面: %@ (title=%@ navTitle=%@)", clsName, self.title, self.navigationItem.title);
+    // 追加到现有右上角按钮后面, 不覆盖页面原有按钮
+    NSMutableArray *items = [self.navigationItem.rightBarButtonItems mutableCopy];
+    if (!items) {
+        items = [NSMutableArray array];
+        if (self.navigationItem.rightBarButtonItem) [items addObject:self.navigationItem.rightBarButtonItem];
+    }
+    for (UIBarButtonItem *it in items) {
+        if ([it.title isEqualToString:@"批量删除"]) return; // 已加过
+    }
     UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"批量删除"
                                                             style:UIBarButtonItemStylePlain
                                                            target:self
                                                            action:@selector(wcbl_openBatchDelete)];
-    // 保留原有按钮的话可以加到 left, 这里直接设 right
-    self.navigationItem.rightBarButtonItem = btn;
+    [items addObject:btn];
+    self.navigationItem.rightBarButtonItems = items;
+    WCBLLog(@"已注入批量删除按钮");
 }
 
 %new
