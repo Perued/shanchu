@@ -11,11 +11,6 @@
 
 #pragma mark - 前向声明
 
-@interface MMServiceCenter : NSObject
-+ (instancetype)defaultCenter;
-- (id)getService:(Class)cls;
-@end
-
 @interface ContactBatchModifyLogic : NSObject
 - (void)setM_delegate:(id)delegate;
 - (void)batchModContactTypeWithAddContantctAr:(NSArray *)addAr
@@ -154,13 +149,35 @@ static NSString *WCBLDisplayName(id contact) {
     return @"(未知)";
 }
 
+// 8.0.74 里没有 +[MMServiceCenter defaultCenter], 微信自己用的是:
+//   [[MMContext currentContext] getService:[Xxx class]]   (loadContacts 反汇编确认)
+static id WCBLGetService(Class cls) {
+    if (!cls) return nil;
+    @try {
+        Class ctxCls = objc_getClass("MMContext");
+        SEL cur = NSSelectorFromString(@"currentContext");
+        if (ctxCls && [ctxCls respondsToSelector:cur]) {
+            id ctx = ((id (*)(id, SEL))objc_msgSend)(ctxCls, cur);
+            if ([ctx respondsToSelector:@selector(getService:)])
+                return ((id (*)(id, SEL, Class))objc_msgSend)(ctx, @selector(getService:), cls);
+        }
+        // 兜底: 旧版本才有的 MMServiceCenter defaultCenter (必须先检查是否响应)
+        Class scCls = objc_getClass("MMServiceCenter");
+        SEL dc = NSSelectorFromString(@"defaultCenter");
+        if (scCls && [scCls respondsToSelector:dc]) {
+            id c = ((id (*)(id, SEL))objc_msgSend)(scCls, dc);
+            if ([c respondsToSelector:@selector(getService:)])
+                return ((id (*)(id, SEL, Class))objc_msgSend)(c, @selector(getService:), cls);
+        }
+    } @catch (NSException *e) { WCBLLog(@"getService 异常: %@", e); }
+    return nil;
+}
+
 static CContactMgr *WCBLContactMgr(void) {
-    Class centerCls = objc_getClass("MMServiceCenter");
     Class mgrCls = objc_getClass("CContactMgr");
-    if (!centerCls || !mgrCls) return nil;
-    id center = [centerCls defaultCenter];
-    if (![center respondsToSelector:@selector(getService:)]) return nil;
-    id svc = [center getService:mgrCls];
+    if (!mgrCls) { WCBLLog(@"找不到 CContactMgr 类"); return nil; }
+    id svc = WCBLGetService(mgrCls);
+    if (!svc) WCBLLog(@"getService:CContactMgr 返回 nil");
     return [svc isKindOfClass:mgrCls] ? svc : nil;
 }
 
@@ -237,9 +254,8 @@ static void WCBLLocalCleanup(id contact) {
         NSString *un = nil;
         @try { un = [contact valueForKey:@"m_nsUsrName"]; } @catch (NSException *e) {}
         Class sc = objc_getClass("MMNewSessionMgr");
-        Class cc = objc_getClass("MMServiceCenter");
-        if (un.length && sc && cc) {
-            id sm = [[cc defaultCenter] getService:sc];
+        if (un.length && sc) {
+            id sm = WCBLGetService(sc);
             if ([sm respondsToSelector:@selector(DeleteSessionOfUser:)]) [sm DeleteSessionOfUser:un];
         }
     } @catch (NSException *e) { WCBLLog(@"本地清理异常: %@", e); }
@@ -581,18 +597,8 @@ static void WCBLInject(UIViewController *vc) {
 
     // 1) 导航栏按钮
     NSMutableArray *items = [vc.navigationItem.rightBarButtonItems mutableCopy] ?: [NSMutableArray array];
-    UIBarButtonItem *btn = nil;
-    UIAction *act = nil;
-    if (@available(iOS 14.0, *)) {
-        // 用 UIAction 回调, 不经过 -[UIApplication sendAction:to:from:forEvent:],
-        // 避免被其他插件 (如 QiangDanAuto) 对该方法的 hook 干扰而崩溃
-        act = [UIAction actionWithTitle:@"批量删除" image:nil identifier:nil
-                                handler:^(__kindof UIAction *a) { [target open]; }];
-        btn = [[UIBarButtonItem alloc] initWithTitle:@"批量删除" image:nil primaryAction:act menu:nil];
-    } else {
-        btn = [[UIBarButtonItem alloc] initWithTitle:@"批量删除" style:UIBarButtonItemStylePlain
-                                              target:target action:@selector(open)];
-    }
+    UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"批量删除" style:UIBarButtonItemStylePlain
+                                                           target:target action:@selector(open)];
     [items addObject:btn];
     vc.navigationItem.rightBarButtonItems = items;
 
@@ -606,11 +612,7 @@ static void WCBLInject(UIViewController *vc) {
     fab.frame = CGRectMake(vc.view.bounds.size.width - 110,
                            vc.view.bounds.size.height - vc.view.safeAreaInsets.bottom - 90, 96, 40);
     fab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
-    if (act) {
-        if (@available(iOS 14.0, *)) [fab addAction:act forControlEvents:UIControlEventTouchUpInside];
-    } else {
-        [fab addTarget:target action:@selector(open) forControlEvents:UIControlEventTouchUpInside];
-    }
+    [fab addTarget:target action:@selector(open) forControlEvents:UIControlEventTouchUpInside];
     [vc.view addSubview:fab];
     WCBLLog(@"已注入批量删除按钮");
 }
