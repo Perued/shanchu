@@ -1,218 +1,428 @@
-#import <Foundation/Foundation.h>
+// WCBlackListBatchDelete - 微信黑名单多选一键删除 + 自定义删除间隔
+// 分析基础: 微信 8.0.74 二进制
+//   - 删除后端: ContactBatchModifyLogic -batchModContactTypeWithAddContantctAr:deleteContantctAr:modContactType:
+//     (modContactType=1 为删除, 实证自 MultiDeleteContactsViewController -deleteSelectedContacts 反汇编)
+//   - 单批上限: getMaxBatchOnceNumber = 50, 本 tweak 逐个删除以支持自定义间隔
+//   - 黑名单判断: CContactMgr -isContactBlack:
+//   - 服务: [MMServiceCenter defaultCenter] getService:
 
-// ==========================================
-// 1. 获取沙盒路径
-// ==========================================
-static NSString *getConfigPlistPath() {
-    NSString *docDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    return [docDir stringByAppendingPathComponent:@"InterceptConfig.plist"];
-}
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 
-static NSString *getLogFilePath() {
-    NSString *docDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    return [docDir stringByAppendingPathComponent:@"InterceptLog.txt"];
-}
+#pragma mark - 前向声明 (微信内部类)
 
-// ==========================================
-// 2. 通用日志写入模块
-// ==========================================
-static void writeLog(NSString *msg) {
-    NSString *logPath = getLogFilePath();
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
-    NSString *timeStr = [formatter stringFromDate:[NSDate date]];
-    NSString *logMsg = [NSString stringWithFormat:@"[%@] %@\n", timeStr, msg];
-    
-    if (![[NSFileManager defaultManager] fileExistsAtPath:logPath]) {
-        [logMsg writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    } else {
-        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:logPath];
-        [handle seekToEndOfFile];
-        [handle writeData:[logMsg dataUsingEncoding:NSUTF8StringEncoding]];
-        [handle closeFile];
-    }
-}
+@interface MMServiceCenter : NSObject
++ (instancetype)defaultCenter;
+- (id)getService:(Class)cls;
+@end
 
-// ==========================================
-// 3. 核心拦截器 (URL 域名匹配)
-// ==========================================
-static NSURL* processURL(NSURL *originalURL) {
-    if (!originalURL) return originalURL;
-    NSString *urlStr = originalURL.absoluteString;
-    if (urlStr.length == 0) return originalURL;
-    
-    NSDictionary *config = [NSDictionary dictionaryWithContentsOfFile:getConfigPlistPath()];
-    if (config) {
-        NSArray *domains = config[@"TargetDomains"];
-        if ([domains isKindOfClass:[NSArray class]]) {
-            for (NSString *domain in domains) {
-                if (domain.length > 0 && [urlStr containsString:domain]) {
-                    if ([config[@"EnableLogging"] boolValue]) {
-                        writeLog([NSString stringWithFormat:@"🛡️ 域名拦截: %@", urlStr]);
-                    }
-                    return [NSURL URLWithString:@"http://127.0.0.1/blackhole_dynamic_plist"];
-                }
-            }
-        }
-    }
-    return originalURL;
-}
+@interface ContactBatchModifyLogic : NSObject
+- (void)setM_delegate:(id)delegate;
+- (void)batchModContactTypeWithAddContantctAr:(NSArray *)addAr
+                           deleteContantctAr:(NSArray *)delAr
+                               modContactType:(int)type;
+@end
 
-// ==========================================
-// 4. 插件初始化：自动生成包含“动态篡改字典”的 Plist
-// ==========================================
-%ctor {
-    NSString *plistPath = getConfigPlistPath();
-    if (![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-        NSDictionary *defaultConfig = @{
-            @"EnableLogging": @(YES),
-            @"AutoRecordNewParams": @(YES), // 开启自动收录新字段
-            @"TargetDomains": @[
-                @"ddk_transporterinfo_updateCoordinator_v1"
-            ],
-            @"ResponseReplacements": @{     // 动态篡改字典 (Key: 字段名, Value: 你的自定义值)
-                @"ForbiddenJailBroken": @"0",
-                @"forceUnRoot": @"0",
-                @"DDJailBrokenMonterAppName": @"com.fake.app.nothing"
-            }
-        };
-        [defaultConfig writeToFile:plistPath atomically:YES];
-    }
-}
+@protocol ContactBatchModifyLogicDelegate <NSObject>
+@optional
+- (void)OnContactBatchModify:(id)arg1 withRet:(int)arg2 errorMsg:(id)arg3 isNetWorkError:(BOOL)arg4;
+@end
 
-// ==========================================
-// 5. 网络请求 Hook 层 (基于 URL 拦截)
-// ==========================================
-%hook NSMutableURLRequest
-- (void)setURL:(NSURL *)URL {
-    NSURL *safeURL = processURL(URL);
-    %orig(safeURL);
-}
-%end
+#pragma mark - 常量
 
-%hook NSURLRequest
-+ (instancetype)requestWithURL:(NSURL *)URL {
-    NSURL *safeURL = processURL(URL);
-    return %orig(safeURL);
-}
-- (instancetype)initWithURL:(NSURL *)URL {
-    NSURL *safeURL = processURL(URL);
-    return %orig(safeURL);
-}
-- (instancetype)initWithURL:(NSURL *)URL cachePolicy:(NSURLRequestCachePolicy)cachePolicy timeoutInterval:(NSTimeInterval)timeoutInterval {
-    NSURL *safeURL = processURL(URL);
-    return %orig(safeURL, cachePolicy, timeoutInterval);
-}
-%end
+static NSString *const kWCBLIntervalKey = @"WCBLDeleteInterval";
+static const NSTimeInterval kWCBLDefaultInterval = 5.0;
+static const NSTimeInterval kWCBLMaxInterval = 300.0;
 
-// ==========================================
-// 6. JSON 数据篡改与后台自动收录层
-// ==========================================
-%hook NSJSONSerialization
+#define WCBLLog(fmt, ...) NSLog(@"[WCBL] " fmt, ##__VA_ARGS__)
 
-+ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)error {
-    id result = %orig(data, opt, error);
+#pragma mark - 工具函数
 
-    // 基础类型校验
-    if (![result isKindOfClass:[NSDictionary class]]) return result;
-    NSDictionary *dict = (NSDictionary *)result;
-    
-    NSDictionary *content = dict[@"content"];
-    if (![content isKindOfClass:[NSDictionary class]]) return result;
-
-    NSArray *resultArray = content[@"result"];
-    if (![resultArray isKindOfClass:[NSArray class]]) return result;
-
-    NSDictionary *config = [NSDictionary dictionaryWithContentsOfFile:getConfigPlistPath()];
-    NSDictionary *replacements = config[@"ResponseReplacements"];
-    BOOL enableLogging = [config[@"EnableLogging"] boolValue];
-    BOOL autoRecord = [config[@"AutoRecordNewParams"] boolValue];
-    
-    // 【功能 A】：异步后台收录未知的下发字段
-    if (autoRecord) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-            NSMutableDictionary *liveConfig = [[NSDictionary dictionaryWithContentsOfFile:getConfigPlistPath()] mutableCopy];
-            if (liveConfig) {
-                NSMutableDictionary *liveReplacements = [liveConfig[@"ResponseReplacements"] mutableCopy] ?: [NSMutableDictionary dictionary];
-                BOOL needSave = NO;
-                
-                for (NSDictionary *item in resultArray) {
-                    if ([item isKindOfClass:[NSDictionary class]]) {
-                        NSString *pName = item[@"paramName"];
-                        NSString *pVal = item[@"paramValue"];
-                        // 如果 Plist 里还没有这个字段，就把官方的默认值先收录进去
-                        if (pName && pVal && !liveReplacements[pName]) {
-                            liveReplacements[pName] = pVal;
-                            needSave = YES;
-                        }
-                    }
-                }
-                // 只有发现新字段时才执行耗时的磁盘写入
-                if (needSave) {
-                    liveConfig[@"ResponseReplacements"] = liveReplacements;
-                    [liveConfig writeToFile:getConfigPlistPath() atomically:YES];
-                    if (enableLogging) {
-                        writeLog(@"📝 Plist更新: 已将服务端新下发的字段收录进字典，可前往修改。");
-                    }
-                }
-            }
-        });
-    }
-
-    // 【功能 B】：实时动态篡改已配置的字段
-    if ([replacements isKindOfClass:[NSDictionary class]] && replacements.count > 0) {
+// 取联系人显示名 (多 key 兼容)
+static NSString *WCBLDisplayName(id contact) {
+    NSArray *nickKeys = @[@"m_nsNickName", @"nickName", @"m_nsRemark", @"remark"];
+    for (NSString *k in nickKeys) {
         @try {
-            BOOL isModified = NO;
-            NSMutableArray *logDetails = [NSMutableArray array];
-            
-            NSMutableDictionary *mutDict = [dict mutableCopy];
-            NSMutableDictionary *mutContent = [content mutableCopy];
-            NSMutableArray *mutArray = [NSMutableArray array];
+            id v = [contact valueForKey:k];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) return v;
+        } @catch (NSException *e) {}
+    }
+    NSArray *userKeys = @[@"m_nsUsrName", @"usrName", @"m_nsUserName", @"userName"];
+    for (NSString *k in userKeys) {
+        @try {
+            id v = [contact valueForKey:k];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) return v;
+        } @catch (NSException *e) {}
+    }
+    return @"(未知)";
+}
 
-            for (NSDictionary *item in resultArray) {
-                if ([item isKindOfClass:[NSDictionary class]]) {
-                    NSString *name = item[@"paramName"];
-                    
-                    // 如果当前字段在你 Plist 的替换名单里
-                    if (name && replacements[name]) {
-                        NSMutableDictionary *mutItem = [item mutableCopy];
-                        NSString *originalVal = [NSString stringWithFormat:@"%@", mutItem[@"paramValue"]];
-                        NSString *targetVal = [NSString stringWithFormat:@"%@", replacements[name]];
-                        
-                        // 只有当官方下发的值和你的目标值不一样时，才进行篡改
-                        if (![originalVal isEqualToString:targetVal]) {
-                            mutItem[@"paramValue"] = targetVal;
-                            isModified = YES;
-                            [logDetails addObject:[NSString stringWithFormat:@"%@ (%@ -> %@)", name, originalVal, targetVal]];
-                        }
-                        [mutArray addObject:mutItem];
-                    } else {
-                        [mutArray addObject:item];
-                    }
-                } else {
-                    [mutArray addObject:item];
-                }
-            }
+// 取 CContactMgr 单例
+static id WCBLContactMgr(void) {
+    Class centerCls = objc_getClass("MMServiceCenter");
+    Class mgrCls = objc_getClass("CContactMgr");
+    if (!centerCls || !mgrCls) return nil;
+    id center = [centerCls defaultCenter];
+    if (![center respondsToSelector:@selector(getService:)]) return nil;
+    return [center getService:mgrCls];
+}
 
-            // 如果发生了篡改，将修改后的数据返回给 App
-            if (isModified) {
-                mutContent[@"result"] = mutArray;
-                mutDict[@"content"] = mutContent;
-                if (enableLogging) {
-                    writeLog([NSString stringWithFormat:@"✅ JSON篡改成功: %@", [logDetails componentsJoinedByString:@", "]]);
-                }
-                return mutDict;
-            }
+// 获取黑名单联系人数组
+static NSArray *WCBLFetchBlackListContacts(void) {
+    id mgr = WCBLContactMgr();
+    if (!mgr) { WCBLLog(@"CContactMgr 获取失败"); return @[]; }
 
-        } @catch (NSException *exception) {
-            if (enableLogging) {
-                writeLog([NSString stringWithFormat:@"❌ JSON篡改异常: %@", exception.reason]);
+    NSMutableArray *all = [NSMutableArray array];
+    // getAllContactList:listType: 为填充式 (NSMutableArray*, int), 反汇编确认 x2=数组 x3=类型
+    if ([mgr respondsToSelector:@selector(getAllContactList:listType:)]) {
+        for (int t = 0; t <= 3; t++) {
+            @try {
+                NSUInteger before = all.count;
+                [mgr getAllContactList:all listType:t];
+                WCBLLog(@"getAllContactList:listType:%d 新增 %lu", t, (unsigned long)(all.count - before));
+            } @catch (NSException *e) {
+                WCBLLog(@"listType %d 异常: %@", t, e);
             }
-            return result;
         }
     }
+    // 备用: getContactList:contactType:
+    if (all.count == 0 && [mgr respondsToSelector:@selector(getContactList:contactType:)]) {
+        @try {
+            NSArray *r = [mgr getContactList:nil contactType:0];
+            if ([r isKindOfClass:[NSArray class]]) [all addObjectsFromArray:r];
+        } @catch (NSException *e) {}
+    }
+    WCBLLog(@"共取到 %lu 个联系人, 开始过滤黑名单", (unsigned long)all.count);
 
-    return result;
+    NSMutableArray *black = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    BOOL canCheck = [mgr respondsToSelector:@selector(isContactBlack:)];
+    for (id c in all) {
+        @try {
+            BOOL isBL = canCheck ? (BOOL)[mgr isContactBlack:c] : NO;
+            if (isBL) {
+                // 去重 (按指针)
+                NSValue *key = [NSValue valueWithNonretainedObject:c];
+                if (![seen containsObject:key]) { [seen addObject:key]; [black addObject:c]; }
+            }
+        } @catch (NSException *e) {}
+    }
+    WCBLLog(@"黑名单联系人 %lu 个", (unsigned long)black.count);
+    return black;
+}
+
+#pragma mark - 批量删除 VC
+
+@interface WCBLBatchDeleteViewController : UIViewController
+<UITableViewDelegate, UITableViewDataSource, ContactBatchModifyLogicDelegate>
+@property (nonatomic, strong) NSArray *contacts;
+@property (nonatomic, strong) NSMutableSet<NSNumber *> *selected; // 选中下标
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) UIStepper *stepper;
+@property (nonatomic, strong) UILabel *intervalLabel;
+@property (nonatomic, strong) UIButton *deleteButton;
+@property (nonatomic, strong) UIProgressView *progressView;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, assign) NSTimeInterval interval;
+// 删除引擎
+@property (nonatomic, strong) ContactBatchModifyLogic *batchLogic;
+@property (nonatomic, strong) NSArray *deleteQueue;
+@property (nonatomic, assign) NSInteger deleteIndex;
+@property (nonatomic, assign) NSInteger successCount;
+@property (nonatomic, assign) NSInteger failCount;
+@property (nonatomic, assign) BOOL isDeleting;
+- (instancetype)initWithContacts:(NSArray *)contacts;
+@end
+
+@implementation WCBLBatchDeleteViewController
+
+- (instancetype)initWithContacts:(NSArray *)contacts {
+    if (self = [super init]) {
+        _contacts = contacts;
+        _selected = [NSMutableSet set];
+        _interval = [[NSUserDefaults standardUserDefaults] doubleForKey:kWCBLIntervalKey];
+        if (_interval < 1) _interval = kWCBLDefaultInterval;
+    }
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = [NSString stringWithFormat:@"黑名单批量删除 (%lu)", (unsigned long)self.contacts.count];
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+
+    // 全选按钮
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"全选" style:UIBarButtonItemStylePlain
+                                       target:self action:@selector(onSelectAllTapped)];
+
+    CGFloat bottomH = 150;
+    CGRect bounds = self.view.bounds;
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, 0, bounds.size.width, bounds.size.height - bottomH)
+                                                 style:UITableViewStylePlain];
+    self.tableView.delegate = self;
+    self.tableView.dataSource = self;
+    self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:self.tableView];
+
+    UIView *bottom = [[UIView alloc] initWithFrame:CGRectMake(0, bounds.size.height - bottomH, bounds.size.width, bottomH)];
+    bottom.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    bottom.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    [self.view addSubview:bottom];
+
+    // 间隔设置行
+    UILabel *cap = [[UILabel alloc] initWithFrame:CGRectMake(16, 8, 120, 30)];
+    cap.text = @"删除间隔(秒)";
+    cap.font = [UIFont systemFontOfSize:14];
+    [bottom addSubview:cap];
+
+    self.intervalLabel = [[UILabel alloc] initWithFrame:CGRectMake(140, 8, 60, 30)];
+    self.intervalLabel.font = [UIFont boldSystemFontOfSize:16];
+    [bottom addSubview:self.intervalLabel];
+
+    self.stepper = [[UIStepper alloc] initWithFrame:CGRectMake(210, 8, 100, 30)];
+    self.stepper.minimumValue = 1;
+    self.stepper.maximumValue = kWCBLMaxInterval;
+    self.stepper.stepValue = 1;
+    self.stepper.value = self.interval;
+    [self.stepper addTarget:self action:@selector(onStepperChanged) forControlEvents:UIControlEventValueChanged];
+    [bottom addSubview:self.stepper];
+    [self refreshIntervalLabel];
+
+    // 进度
+    self.progressView = [[UIProgressView alloc] initWithFrame:CGRectMake(16, 48, bounds.size.width - 32, 10)];
+    self.progressView.progress = 0;
+    [bottom addSubview:self.progressView];
+
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 60, bounds.size.width - 32, 20)];
+    self.statusLabel.font = [UIFont systemFontOfSize:12];
+    self.statusLabel.textColor = [UIColor secondaryLabelColor];
+    self.statusLabel.text = @"就绪";
+    [bottom addSubview:self.statusLabel];
+
+    // 删除按钮
+    self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.deleteButton.frame = CGRectMake(16, 86, bounds.size.width - 32, 48);
+    self.deleteButton.backgroundColor = [UIColor systemRedColor];
+    [self.deleteButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.deleteButton.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    self.deleteButton.layer.cornerRadius = 8;
+    [self.deleteButton addTarget:self action:@selector(onDeleteTapped) forControlEvents:UIControlEventTouchUpInside];
+    [bottom addSubview:self.deleteButton];
+    [self refreshDeleteButton];
+}
+
+- (void)onStepperChanged {
+    self.interval = self.stepper.value;
+    [[NSUserDefaults standardUserDefaults] setDouble:self.interval forKey:kWCBLIntervalKey];
+    [self refreshIntervalLabel];
+}
+- (void)refreshIntervalLabel {
+    self.intervalLabel.text = [NSString stringWithFormat:@"%.0f", self.interval];
+}
+
+- (void)onSelectAllTapped {
+    BOOL allSelected = self.selected.count == self.contacts.count;
+    [self.selected removeAllObjects];
+    if (!allSelected) {
+        for (NSInteger i = 0; i < self.contacts.count; i++)
+            [self.selected addObject:@(i)];
+    }
+    self.navigationItem.rightBarButtonItem.title = allSelected ? @"全选" : @"取消全选";
+    [self.tableView reloadData];
+    [self refreshDeleteButton];
+}
+
+- (void)refreshDeleteButton {
+    [self.deleteButton setTitle:[NSString stringWithFormat:@"删除选中 (%lu)", (unsigned long)self.selected.count]
+                       forState:UIControlStateNormal];
+    self.deleteButton.enabled = !self.isDeleting && self.selected.count > 0;
+    self.deleteButton.alpha = self.deleteButton.enabled ? 1.0 : 0.5;
+}
+
+#pragma mark TableView
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return self.contacts.count; }
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    static NSString *rid = @"wcbl_cell";
+    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:rid];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:rid];
+    cell.textLabel.text = WCBLDisplayName(self.contacts[ip.row]);
+    cell.accessoryType = [self.selected containsObject:@(ip.row)] ?
+        UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    return cell;
+}
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    if (self.isDeleting) return;
+    NSNumber *k = @(ip.row);
+    if ([self.selected containsObject:k]) [self.selected removeObject:k];
+    else [self.selected addObject:k];
+    [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+    [self refreshDeleteButton];
+}
+
+#pragma mark 删除引擎 (逐个 + 自定义间隔)
+
+- (void)onDeleteTapped {
+    if (self.isDeleting || self.selected.count == 0) return;
+    NSMutableArray *queue = [NSMutableArray array];
+    for (NSNumber *n in self.selected) [queue addObject:self.contacts[n.integerValue]];
+
+    NSString *msg = [NSString stringWithFormat:@"将逐个删除 %lu 个联系人, 间隔 %.0f 秒。删除后不可恢复, 是否继续?",
+                     (unsigned long)queue.count, self.interval];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"确认删除"
+                                                                message:msg
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a){ [ws startDelete:queue]; }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)startDelete:(NSArray *)queue {
+    self.isDeleting = YES;
+    self.deleteQueue = queue;
+    self.deleteIndex = 0;
+    self.successCount = 0;
+    self.failCount = 0;
+    [self refreshDeleteButton];
+    self.navigationItem.rightBarButtonItem.enabled = NO;
+
+    Class logicCls = objc_getClass("ContactBatchModifyLogic");
+    if (!logicCls) {
+        [self finishWithError:@"ContactBatchModifyLogic 不存在 (版本不匹配)"];
+        return;
+    }
+    self.batchLogic = [[logicCls alloc] init];
+    if ([self.batchLogic respondsToSelector:@selector(setM_delegate:)])
+        [self.batchLogic setM_delegate:self];
+
+    WCBLLog(@"开始批量删除, 共 %lu 个, 间隔 %.0fs", (unsigned long)queue.count, self.interval);
+    [self deleteNext];
+}
+
+- (void)deleteNext {
+    if (self.deleteIndex >= self.deleteQueue.count) { [self finishDone]; return; }
+    id contact = self.deleteQueue[self.deleteIndex];
+    NSString *name = WCBLDisplayName(contact);
+    WCBLLog(@"删除 %ld/%lu: %@", (long)(self.deleteIndex + 1), (unsigned long)self.deleteQueue.count, name);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.statusLabel.text = [NSString stringWithFormat:@"正在删除 %ld/%lu: %@",
+                                 (long)(self.deleteIndex + 1), (unsigned long)self.deleteQueue.count, name];
+        self.progressView.progress = (float)self.deleteIndex / (float)self.deleteQueue.count;
+    });
+    // modContactType=1 为删除 (实证自 deleteSelectedContacts 反汇编)
+    [self.batchLogic batchModContactTypeWithAddContantctAr:nil
+                                        deleteContantctAr:@[contact]
+                                            modContactType:1];
+}
+
+// ContactBatchModifyLogicDelegate 回调
+- (void)OnContactBatchModify:(id)arg1 withRet:(int)ret errorMsg:(id)msg isNetWorkError:(BOOL)isErr {
+    NSInteger done = self.deleteIndex + 1;
+    if (ret == 0) self.successCount++;
+    else { self.failCount++; WCBLLog(@"删除失败 idx=%ld ret=%d msg=%@", (long)self.deleteIndex, ret, msg); }
+    self.deleteIndex = done;
+
+    if (self.deleteIndex >= self.deleteQueue.count) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self finishDone]; });
+        return;
+    }
+    // 自定义间隔后删下一个
+    NSTimeInterval iv = self.interval;
+    WCBLLog(@"等待 %.0fs 后继续 (%ld/%lu)", iv, (long)(done + 1), (unsigned long)self.deleteQueue.count);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(iv * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self deleteNext]; });
+}
+
+- (void)finishDone {
+    self.isDeleting = NO;
+    self.batchLogic = nil;
+    self.progressView.progress = 1.0;
+    NSString *msg = [NSString stringWithFormat:@"完成: 成功 %ld, 失败 %ld",
+                     (long)self.successCount, (long)self.failCount];
+    self.statusLabel.text = msg;
+    WCBLLog(@"%@", msg);
+    [self refreshDeleteButton];
+    self.navigationItem.rightBarButtonItem.enabled = YES;
+    // 刷新列表 (重新拉取黑名单)
+    if (self.successCount > 0) {
+        NSArray *fresh = WCBLFetchBlackListContacts();
+        self.contacts = fresh;
+        [self.selected removeAllObjects];
+        self.title = [NSString stringWithFormat:@"黑名单批量删除 (%lu)", (unsigned long)fresh.count];
+        [self.tableView reloadData];
+        [self refreshDeleteButton];
+    }
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"批量删除完成" message:msg
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)finishWithError:(NSString *)msg {
+    self.isDeleting = NO;
+    self.statusLabel.text = msg;
+    [self refreshDeleteButton];
+    self.navigationItem.rightBarButtonItem.enabled = YES;
+}
+
+@end
+
+#pragma mark - 入口注入 (黑名单页面)
+
+%hook UIViewController
+
+%new
+- (void)wcbl_maybeInject {
+    static const void *kKey = &kKey;
+    if (objc_getAssociatedObject(self, kKey)) return;
+    objc_setAssociatedObject(self, kKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    NSString *clsName = NSStringFromClass([self class]);
+    BOOL match = [clsName rangeOfString:@"BlackList" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    if (!match) {
+        NSString *t = self.title ?: self.navigationItem.title;
+        if ([t isEqualToString:@"通讯录黑名单"]) match = YES;
+    }
+    if (!match) return;
+
+    WCBLLog(@"检测到黑名单页面: %@", clsName);
+    UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"批量删除"
+                                                            style:UIBarButtonItemStylePlain
+                                                           target:self
+                                                           action:@selector(wcbl_openBatchDelete)];
+    // 保留原有按钮的话可以加到 left, 这里直接设 right
+    self.navigationItem.rightBarButtonItem = btn;
+}
+
+%new
+- (void)wcbl_openBatchDelete {
+    NSArray *contacts = WCBLFetchBlackListContacts();
+    if (contacts.count == 0) {
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"提示"
+                                                                    message:@"未获取到黑名单联系人 (可能页面识别或接口不匹配, 详见日志)"
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+    WCBLBatchDeleteViewController *vc = [[WCBLBatchDeleteViewController alloc] initWithContacts:contacts];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    [self wcbl_maybeInject];
 }
 
 %end
+
+#pragma mark - 构造
+
+%ctor {
+    WCBLLog(@"WCBlackListBatchDelete 加载完成");
+}
